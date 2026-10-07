@@ -22,7 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 APP_TITLE = "FindIt - Campus Lost & Found"
 APP_NAME = "FindIt"
 TAGLINE = "Report something you lost, or claim something that was found."
-PORT = 7860
+PORT = int(os.getenv("PORT", 7860))      # hosts like Render set PORT
+HOSTED = bool(os.getenv("PORT"))            # True when running on a server
+RATE_LIMIT = 30                             # AI requests per IP per hour (protects credits)
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-72B-Instruct")
 MAX_ATTEMPTS = 3
 THEME = "soft"   # choose: "soft", "blue", "red" or "green"
@@ -39,7 +41,7 @@ THEMES = {
              "--bd:#ddd8cc;--soft:#eef3ee;--ok:#1f7a3a;--bad:#b3261e",
 }
 
-DB = "lostfound_lite.db"
+DB = os.getenv("DB_PATH", "lostfound_lite.db")
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 STOP = set("a an the and or of in on at to is it my i was with for this that near from by "
            "have has had very lost found some one been left".split())
@@ -648,6 +650,21 @@ form('rf','/api/report');form('cf','/api/claim');refresh();ping();
 """
 
 
+_hits = {}
+
+
+def too_many(ip):
+    """Simple per-IP limit for the AI endpoints so strangers cannot drain free credits."""
+    now = time.time()
+    recent = [t for t in _hits.get(ip, []) if now - t < 3600]
+    if len(recent) >= RATE_LIMIT:
+        _hits[ip] = recent
+        return True
+    recent.append(now)
+    _hits[ip] = recent
+    return False
+
+
 class Server(ThreadingHTTPServer):
     # On Windows, reuse lets a 2nd copy start on a busy port while the OLD copy keeps answering.
     allow_reuse_address = os.name != "nt"
@@ -680,6 +697,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:
             body = {}
+        ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+        if self.path in ("/api/chat", "/api/relink") and too_many(ip):
+            return self._send(200, {"reply": "Too many AI requests from your network. Please wait a while and try again."})
         if self.path == "/api/chat":
             msg = str(body.get("message", ""))[:1000]
             reply = agent_reply(str(body.get("sid", "x")), msg)
@@ -701,7 +721,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init_db()
     try:
-        server = Server(("127.0.0.1", PORT), Handler)
+        server = Server(("0.0.0.0" if HOSTED else "127.0.0.1", PORT), Handler)
     except OSError:
         print(f"\nPort {PORT} is already in use, so FindIt is probably already running in another window.")
         print("Close that black window (or run: taskkill /F /IM python.exe), then start this again.")
@@ -712,7 +732,8 @@ def main():
     print(f"{APP_TITLE}  [version 4]\n{mode}\nOpen {url}   (Ctrl+C to stop)")
     if not TOKEN:
         print(f"Looking for the token in: {TOKEN_PATH}  (file found: {os.path.exists(TOKEN_PATH)})")
-    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    if not HOSTED:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     server.serve_forever()
 
 
